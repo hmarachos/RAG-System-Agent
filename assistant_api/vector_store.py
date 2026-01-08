@@ -1,15 +1,16 @@
 """
-Модуль работы с векторным хранилищем ChromaDB.
+Модуль работы с векторным хранилищем Qdrant.
 Обрабатывает загрузку документов, chunking и поиск по векторам.
 """
 
-import chromadb
-from chromadb.config import Settings
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
 from typing import List, Dict, Any
 import os
 from openai import OpenAI
 from dotenv import load_dotenv
 from pathlib import Path
+import uuid
 
 
 env_path = Path(__file__).parent.parent / '.env'
@@ -21,35 +22,73 @@ else:
 
 
 class VectorStore:
-    """Векторное хранилище на основе ChromaDB."""
+    """Векторное хранилище на основе Qdrant."""
     
-    def __init__(self, collection_name: str = "rag_collection", persist_directory: str = "./chroma_db"):
+    def __init__(self, collection_name: str = "rag_collection", persist_directory: str = "./qdrant_db"):
         """
         Инициализация векторного хранилища.
         
         Args:
-            collection_name: имя коллекции в ChromaDB
+            collection_name: имя коллекции в Qdrant
             persist_directory: директория для хранения данных
         """
         self.collection_name = collection_name
         self.persist_directory = persist_directory
         
-        # Инициализация ChromaDB клиента
-        self.client = chromadb.PersistentClient(path=persist_directory)
-        
-        # Получение или создание коллекции
-        try:
-            self.collection = self.client.get_collection(name=collection_name)
-            print(f"Коллекция '{collection_name}' загружена. Документов: {self.collection.count()}")
-        except Exception:
-            self.collection = self.client.create_collection(
-                name=collection_name,
-                metadata={"hnsw:space": "cosine"}
-            )
-            print(f"Создана новая коллекция '{collection_name}'")
+        # Инициализация Qdrant клиента (локальный режим)
+        self.client = QdrantClient(path=persist_directory)
         
         # OpenAI клиент для создания embeddings
         self.openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        # Размерность векторов для text-embedding-3-small
+        self.vector_size = 1536
+        
+        # Создание коллекции если не существует
+        self._ensure_collection_exists()
+    
+    def __enter__(self):
+        """Поддержка context manager."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Автоматическое закрытие при выходе из context manager."""
+        self.close()
+    
+    def close(self):
+        """Закрытие соединения с Qdrant."""
+        if hasattr(self, 'client') and self.client:
+            try:
+                self.client.close()
+                print("✓ Соединение с Qdrant закрыто")
+            except Exception as e:
+                print(f"⚠️ Ошибка при закрытии Qdrant: {e}")
+    
+    def __del__(self):
+        """Автоматическое закрытие при удалении объекта."""
+        self.close()
+    
+    def _ensure_collection_exists(self):
+        """Создание коллекции если она не существует."""
+        try:
+            # Проверяем существование коллекции
+            collections = self.client.get_collections()
+            collection_names = [col.name for col in collections.collections]
+            
+            if self.collection_name in collection_names:
+                # Получаем информацию о коллекции
+                collection_info = self.client.get_collection(self.collection_name)
+                print(f"Коллекция '{self.collection_name}' загружена. Документов: {collection_info.points_count}")
+            else:
+                # Создаем новую коллекцию
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE)
+                )
+                print(f"Создана новая коллекция '{self.collection_name}'")
+        except Exception as e:
+            print(f"Ошибка при работе с коллекцией: {e}")
+            raise
     
     def _chunk_text(self, text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
         """
@@ -226,31 +265,33 @@ class VectorStore:
         print(f"Текст разбит на {len(chunks)} чанков")
         
         # Проверка, не загружены ли уже документы
-        if self.collection.count() > 0:
+        collection_info = self.client.get_collection(self.collection_name)
+        if collection_info.points_count > 0:
             print("Документы уже загружены в коллекцию")
             return
         
-        # Создание embeddings и добавление в ChromaDB
-        documents = []
-        ids = []
-        embeddings = []
+        # Создание embeddings и добавление в Qdrant
+        points = []
         
         for i, chunk in enumerate(chunks):
             # Создание embedding через OpenAI
             embedding = self._create_embedding(chunk)
             
-            documents.append(chunk)
-            ids.append(f"doc_{i}")
-            embeddings.append(embedding)
+            # Создание точки для Qdrant
+            point = PointStruct(
+                id=str(uuid.uuid4()),  # Уникальный ID
+                vector=embedding,
+                payload={"text": chunk, "chunk_id": i}
+            )
+            points.append(point)
             
             if (i + 1) % 10 == 0:
                 print(f"Обработано {i + 1}/{len(chunks)} чанков")
         
-        # Добавление в ChromaDB батчами
-        self.collection.add(
-            documents=documents,
-            embeddings=embeddings,
-            ids=ids
+        # Добавление в Qdrant батчами
+        self.client.upsert(
+            collection_name=self.collection_name,
+            points=points
         )
         
         print(f"Загружено {len(chunks)} документов в коллекцию '{self.collection_name}'")
@@ -285,21 +326,22 @@ class VectorStore:
         # Создание embedding для запроса
         query_embedding = self._create_embedding(query)
         
-        # Поиск в ChromaDB
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k
-        )
+        # Поиск в Qdrant
+        search_results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_embedding,
+            limit=top_k
+        ).points
         
         # Форматирование результатов
         documents = []
-        if results['documents'] and len(results['documents']) > 0:
-            for i in range(len(results['documents'][0])):
-                documents.append({
-                    'id': results['ids'][0][i],
-                    'text': results['documents'][0][i],
-                    'distance': results['distances'][0][i] if 'distances' in results else None
-                })
+        for result in search_results:
+            documents.append({
+                'id': result.id,
+                'text': result.payload['text'],
+                'score': result.score,  # В Qdrant это similarity score (выше = лучше)
+                'chunk_id': result.payload.get('chunk_id', 0)
+            })
         
         return documents
     
@@ -310,11 +352,21 @@ class VectorStore:
         Returns:
             словарь со статистикой
         """
-        return {
-            'name': self.collection_name,
-            'count': self.collection.count(),
-            'persist_directory': self.persist_directory
-        }
+        try:
+            collection_info = self.client.get_collection(self.collection_name)
+            return {
+                'name': self.collection_name,
+                'count': collection_info.points_count,
+                'persist_directory': self.persist_directory,
+                'vector_size': self.vector_size
+            }
+        except Exception as e:
+            return {
+                'name': self.collection_name,
+                'count': 0,
+                'persist_directory': self.persist_directory,
+                'error': str(e)
+            }
 
 
 if __name__ == "__main__":
@@ -325,20 +377,22 @@ if __name__ == "__main__":
         print("Ошибка: установите переменную окружения OPENAI_API_KEY")
         sys.exit(1)
     
-    vector_store = VectorStore(collection_name="test_collection")
+    # Используем context manager для автоматического закрытия
+    with VectorStore(collection_name="test_collection") as vector_store:
+        # Загрузка документов
+        if os.path.exists("data/docs.txt"):
+            vector_store.load_documents("data/docs.txt")
+        
+        # Поиск
+        results = vector_store.search("Что такое машинное обучение?", top_k=3)
+        print("\nРезультаты поиска:")
+        for i, doc in enumerate(results, 1):
+            print(f"\n{i}. {doc['text'][:200]}...")
+            print(f"   Score: {doc['score']:.4f}")
+        
+        # Статистика
+        stats = vector_store.get_collection_stats()
+        print(f"\nСтатистика: {stats}")
     
-    # Загрузка документов
-    if os.path.exists("data/docs.txt"):
-        vector_store.load_documents("data/docs.txt")
-    
-    # Поиск
-    results = vector_store.search("Что такое машинное обучение?", top_k=3)
-    print("\nРезультаты поиска:")
-    for i, doc in enumerate(results, 1):
-        print(f"\n{i}. {doc['text'][:200]}...")
-        print(f"   Distance: {doc['distance']}")
-    
-    # Статистика
-    stats = vector_store.get_collection_stats()
-    print(f"\nСтатистика: {stats}")
+    print("✓ Клиент Qdrant корректно закрыт")
 

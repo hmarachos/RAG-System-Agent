@@ -23,7 +23,7 @@ class RAGPipeline:
         Инициализация RAG pipeline.
         
         Args:
-            collection_name: имя коллекции в ChromaDB
+            collection_name: имя коллекции в Qdrant
             cache_db_path: путь к базе данных кеша
             data_file: путь к файлу с документами
             model: модель GigaChat для генерации ответов
@@ -42,7 +42,8 @@ class RAGPipeline:
         self.vector_store = VectorStore(collection_name=collection_name)
         
         # Загрузка документов, если коллекция пустая
-        if self.vector_store.collection.count() == 0:
+        collection_info = self.vector_store.client.get_collection(collection_name)
+        if collection_info.points_count == 0:
             print(f"Загрузка документов из {data_file}...")
             self.vector_store.load_documents(data_file)
         
@@ -50,6 +51,26 @@ class RAGPipeline:
         self.cache = RAGCache(db_path=cache_db_path)
         
         print("RAG Pipeline инициализирован (GigaChat)")
+    
+    def __enter__(self):
+        """Поддержка context manager."""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Автоматическое закрытие при выходе из context manager."""
+        self.close()
+    
+    def close(self):
+        """Закрытие всех соединений."""
+        if hasattr(self, 'vector_store') and self.vector_store:
+            self.vector_store.close()
+        if hasattr(self, 'cache') and self.cache:
+            # RAGCache не имеет метода close, но это не критично
+            pass
+    
+    def __del__(self):
+        """Автоматическое закрытие при удалении объекта."""
+        self.close()
     
     
     def _create_prompt(self, query: str, context_docs: List[Dict[str, Any]]) -> str:
@@ -199,33 +220,35 @@ if __name__ == "__main__":
     import sys
     
     try:
-        pipeline = RAGPipeline()
-        
-        # Тестовые запросы
-        test_queries = [
-            "Что такое машинное обучение?",
-            "Что такое RAG?",
-            "Как работают трансформеры?"
-        ]
-        
-        for query in test_queries:
-            result = pipeline.query(query)
-            print(f"\n{'='*60}")
-            print(f"Вопрос: {result['query']}")
+        # Используем context manager для автоматического закрытия
+        with RAGPipeline() as pipeline:
+            # Тестовые запросы
+            test_queries = [
+                "Что такое машинное обучение?",
+                "Что такое RAG?",
+                "Как работают трансформеры?"
+            ]
+            
+            for query in test_queries:
+                result = pipeline.query(query)
+                print(f"\n{'='*60}")
+                print(f"Вопрос: {result['query']}")
+                print(f"Из кеша: {result['from_cache']}")
+                print(f"Ответ: {result['answer']}")
+                print(f"{'='*60}\n")
+            
+            # Повторный запрос (должен быть из кеша)
+            print("\n--- Повторный запрос ---")
+            result = pipeline.query(test_queries[0])
             print(f"Из кеша: {result['from_cache']}")
-            print(f"Ответ: {result['answer']}")
-            print(f"{'='*60}\n")
+            
+            # Статистика
+            stats = pipeline.get_stats()
+            print(f"\nСтатистика системы:")
+            print(f"Векторное хранилище: {stats['vector_store']}")
+            print(f"Кеш: {stats['cache']}")
         
-        # Повторный запрос (должен быть из кеша)
-        print("\n--- Повторный запрос ---")
-        result = pipeline.query(test_queries[0])
-        print(f"Из кеша: {result['from_cache']}")
-        
-        # Статистика
-        stats = pipeline.get_stats()
-        print(f"\nСтатистика системы:")
-        print(f"Векторное хранилище: {stats['vector_store']}")
-        print(f"Кеш: {stats['cache']}")
+        print("✓ RAG Pipeline корректно закрыт")
         
     except Exception as e:
         print(f"Ошибка: {e}")
