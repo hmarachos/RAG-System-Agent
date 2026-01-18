@@ -197,14 +197,6 @@ pip install torch==2.0.1 --index-url https://download.pytorch.org/whl/cpu
 - Убедитесь, что `.env` файл находится в корне проекта
 - Проверьте баланс на аккаунте API провайдера
 
-## 📚 Документация
-
-- [QDRANT_MIGRATION.md](QDRANT_MIGRATION.md) - Миграция с ChromaDB на Qdrant
-- [RESOURCE_MANAGEMENT.md](RESOURCE_MANAGEMENT.md) - Управление ресурсами
-- [EVALUATION_SETUP.md](EVALUATION_SETUP.md) - Настройка оценки качества
-- [GROUND_TRUTH_EVALUATION.md](GROUND_TRUTH_EVALUATION.md) - Эталонные ответы
-- [RAGAS_FIX.md](RAGAS_FIX.md) - Исправление проблем RAGAS
-
 ## 🤝 Вклад в проект
 
 1. Fork репозитория
